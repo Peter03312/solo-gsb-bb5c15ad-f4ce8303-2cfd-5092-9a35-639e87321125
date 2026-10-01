@@ -828,7 +828,7 @@ async function openSnapshot(snapshotId) {
                 <td>${esc(n.title)}${n.isRoot ? ' <span class="small-muted">（入展品）</span>' : ''}</td>
                 <td>${n.eligible ? '<span class="pill pill-ok">合格</span>' : n.reasonText.map((t) => `<span class="pill pill-bad">${esc(t)}</span>`).join(' ')}</td>
                 <td>${n.matchedAuthorization ? `#${n.matchedAuthorization.id}（${esc(n.matchedAuthorization.media)}/${esc(n.matchedAuthorization.region)}，${n.matchedAuthorization.validFrom}→${n.matchedAuthorization.validTo}）` : '<span class="small-muted">—</span>'}</td>
-                <td>${n.paths.length}</td>
+                <td>${(n.paths ? n.paths.length : (p.nodePaths || []).find((b) => b.materialId === n.materialId)?.paths.length) ?? 0}</td>
               </tr>`).join('')}
           </table>
         </div>`).join('');

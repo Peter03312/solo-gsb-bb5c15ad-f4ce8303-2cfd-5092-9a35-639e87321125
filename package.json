@@ -6,7 +6,10 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "test": "node test/e2e.js",
+    "attestation:keys": "node scripts/attestation-keys.js",
+    "attestation:verify": "node scripts/verify-attestation.js"
   },
   "engines": {
     "node": ">=20"

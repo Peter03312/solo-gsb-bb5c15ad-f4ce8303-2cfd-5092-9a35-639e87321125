@@ -1005,6 +1005,226 @@ async function call(method, url, body) {
        '响应回显 multiStop/站数与报价输入序号、备注');
   }
 
+  console.log('17) 发布凭证：同事务封存、离线独立校验、篡改检出、授权变更不影响旧凭证、轮换与旧快照补发')
+  {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const { spawnSync } = require('child_process');
+    const Database = require('better-sqlite3');
+    const VERIFIER = path.join(__dirname, '..', 'scripts', 'verify-attestation.js');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'att-e2e-'));
+    let seq = 0;
+    const writeJson = (obj) => {
+      const f = path.join(tmpDir, `f${++seq}.json`);
+      fs.writeFileSync(f, typeof obj === 'string' ? obj : JSON.stringify(obj));
+      return f;
+    };
+    const writePem = (pem) => {
+      const f = path.join(tmpDir, `k${++seq}.pem`);
+      fs.writeFileSync(f, pem);
+      return f;
+    };
+    const offline = (attFile, keyFiles, json = true) => {
+      const args = [VERIFIER, attFile, ...(keyFiles || [])];
+      if (json) args.push('--json');
+      const r = spawnSync(process.execPath, args, { encoding: 'utf8' });
+      let data = null;
+      try { data = JSON.parse(r.stdout); } catch {}
+      return { code: r.status, data, stdout: r.stdout, stderr: r.stderr };
+    };
+    const keysNow = async () => (await call('GET', '/api/attestation-keys')).data.keys;
+    const archiveFile = async () => {
+      const keys = await keysNow();
+      return writePem(keys.map((k) => k.publicKeyPem).join('\n') + '\n');
+    };
+
+    // 隔离的小型来源链：root -> src，两份全域长授权（不依赖演示库状态）
+    const mkMat = async (title) => (await call('POST', '/api/materials', { title, kind: 'x' })).data.id;
+    const root = await mkMat('凭证测试-成片');
+    const src = await mkMat('凭证测试-来源');
+    const link = await call('POST', `/api/materials/${root}/sources`, { sourceMaterialId: src, relation: '引用' });
+    ok(link.status === 201, '凭证测试链 root->src 建立');
+    const authRoot = (await call('POST', `/api/materials/${root}/authorizations`, {
+      media: '*', region: '*', validFrom: '2020-01-01', validTo: '2100-12-31', licensor: 'A',
+    })).data.id;
+    const authSrc = (await call('POST', `/api/materials/${src}/authorizations`, {
+      media: '*', region: '*', validFrom: '2020-01-01', validTo: '2100-12-31', licensor: 'B',
+    })).data.id;
+
+    // 17.1 成功发布：响应自带凭证，含全部证明要素与规则版本
+    const cp = await call('POST', '/api/packages', {
+      name: '凭证测试单站', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-03-01', useTo: '2026-04-30', materialIds: [root],
+    });
+    const pid = cp.data.id;
+    const v = await call('POST', '/api/verify', { packageId: pid });
+    const pub = await call('POST', `/api/packages/${pid}/publish`, { basisVersion: v.data.basisVersion });
+    ok(pub.status === 201 && !!pub.data.attestation && !!pub.data.attestationId,
+      '成功发布返回封存凭证与 attestationId');
+    const att = pub.data.attestation;
+    ok(att.format === 'exhibit-package-attestation' && att.body.snapshotId === pub.data.snapshotId,
+      '凭证信封格式与快照关联正确');
+    for (const f of ['manifest', 'materials', 'sourceSubgraph', 'itinerary', 'terms', 'adoptions', 'paths', 'rules']) {
+      ok(att.body[f] !== undefined, `凭证封存要素存在：${f}`);
+    }
+    ok(att.body.rules.version === v.data.rules.version, '凭证记录核验规则版本');
+    ok(att.body.terms.length === 2
+       && att.body.terms.every((t) => t.revoked === false && [authRoot, authSrc].includes(t.id)),
+       '凭证封存两个节点实际采用的未撤销条款全文');
+    ok(att.body.adoptions.length === 2
+       && att.body.adoptions.every((a) => a.stopPosition === 0),
+       '单站：每个节点一条采用关系');
+    ok(att.body.sourceSubgraph.edges.some((e) => e.from === root && e.to === src),
+       '凭证封存完整来源子图边 root->src');
+    ok(att.body.paths.find((p) => p.materialId === src)
+         .paths.some((p) => p.map((x) => x.materialId).join() === `${root},${src}`),
+       '凭证封存来源节点的全部来源路径');
+    ok(!!att.signature.kid && !!att.signature.value && att.signature.algorithm === 'Ed25519',
+       '凭证带本机持久化密钥的 Ed25519 签名');
+
+    // 17.2 包 DTO 与独立读取端点
+    const pd = await call('GET', `/api/packages/${pid}`);
+    ok(pd.data.attestationId === pub.data.attestationId && !!pd.data.attestationSignedBy,
+      '包 DTO 暴露凭证元数据（不破坏既有字段）');
+    const got = await call('GET', `/api/packages/${pid}/attestation`);
+    ok(got.status === 200 && JSON.stringify(got.data) === JSON.stringify(att), '按包读取凭证内容一致');
+    const bySnap = await call('GET', `/api/attestations/by-snapshot/${pub.data.snapshotId}`);
+    ok(bySnap.status === 200 && bySnap.data.signature.value === att.signature.value, '按发布快照读取凭证');
+    const draftPack = await call('POST', '/api/packages', {
+      name: '凭证测试无授权', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-03-01', useTo: '2026-04-30',
+      materialIds: [(await mkMat('凭证测试-无授权素材'))],
+    });
+    const badPub = await call('POST', `/api/packages/${draftPack.data.id}/publish`, { basisVersion: v.data.basisVersion });
+    ok(badPub.status === 422, '不合格发布仍为 422');
+    const noAtt = await call('GET', `/api/packages/${draftPack.data.id}/attestation`);
+    ok(noAtt.status === 404, '失败发布不封存凭证（404）');
+
+    // 17.3 独立离线校验：仅凭凭证 + 公钥
+    const keys = await keysNow();
+    ok(keys.length >= 1 && keys.every((k) => /^ed25519-[0-9a-f]{32}$/.test(k.kid)), '公钥归档列出受信密钥');
+    const attFile = writeJson(att);
+    let r = offline(attFile, [writePem(keys.map((k) => k.publicKeyPem).join('\n'))]);
+    ok(r.code === 0 && r.data && r.data.conclusion === 'PASS' && r.data.validSignature === true,
+      '离线校验：签名 + 来源链 + 逐站整段覆盖全部通过');
+    ok(r.data.stops.length === 1 && r.data.stops[0].eligible === true && r.data.stops[0].nodeCount === 2,
+      '离线校验返回逐站结论（单站、2 节点均覆盖）');
+    r = offline(attFile, []);
+    ok(r.code === 1 && r.data.tamperReasons.some((x) => x.code === 'SIGNING_KEY_NOT_TRUSTED'),
+      '无公钥时明确拒绝并提示需要可信公钥');
+
+    // 17.4 篡改检出（签名层 + 独立复算层双重）
+    let t = JSON.parse(JSON.stringify(att));
+    t.body.terms[0].validTo = '2020-01-01';
+    r = offline(writeJson(t), [writePem(keys.map((k) => k.publicKeyPem).join('\n'))]);
+    ok(r.code === 1 && r.data.validSignature === false
+       && r.data.tamperReasons.some((x) => x.code === 'SIGNATURE_INVALID'),
+       '篡改条款：签名失效被检出');
+    t = JSON.parse(JSON.stringify(att));
+    t.body.itinerary.stops[0].useFrom = '2101-01-01';
+    t.body.itinerary.stops[0].useTo = '2101-02-01';
+    r = offline(writeJson(t), [writePem(keys.map((k) => k.publicKeyPem).join('\n'))]);
+    ok(r.code === 1 && r.data.conclusion === 'FAIL'
+       && r.data.stops[0].nodes.some((n) => n.reasons.some((x) => x.code === 'DATE_NOT_COVERED')),
+       '篡改站期：离线复算逐站覆盖给出 DATE_NOT_COVERED 篡改原因');
+    t = JSON.parse(JSON.stringify(att));
+    t.body.sourceSubgraph.edges = t.body.sourceSubgraph.edges.filter((e) => !(e.from === root && e.to === src));
+    r = offline(writeJson(t), [writePem(keys.map((k) => k.publicKeyPem).join('\n'))]);
+    ok(r.code === 1
+       && r.data.tamperReasons.some((x) => x.code === 'PATH_FORGED' || x.code === 'ORPHAN_MATERIAL'),
+       '删来源边：来源链复算检出路径/闭包不一致');
+    t = JSON.parse(JSON.stringify(att));
+    t.body.rules.maxChainDepth = 999;
+    r = offline(writeJson(t), [writePem(keys.map((k) => k.publicKeyPem).join('\n'))]);
+    ok(r.code === 1 && r.data.tamperReasons.some((x) => x.code === 'RULE_PARAMS_MISMATCH'),
+       '篡改规则参数被检出');
+
+    // 17.5 发布后撤销并删除授权：包转需复核，但旧凭证离线结论不变
+    await call('POST', `/api/authorizations/${authSrc}/revoke`, {});
+    await call('DELETE', `/api/authorizations/${authSrc}`);
+    const after = await call('GET', `/api/packages/${pid}`);
+    ok(after.data.status === 'needs_review', '授权删除后已发布包转为需复核');
+    const attAgain = await call('GET', `/api/packages/${pid}/attestation`);
+    ok(attAgain.data.signature.value === att.signature.value, '旧凭证内容与签名完全不变');
+    r = offline(attFile, [await archiveFile()]);
+    ok(r.code === 0 && r.data.conclusion === 'PASS', '授权撤销/删除后，旧凭证离线校验仍通过');
+
+    // 17.6 多站凭证：逐站×逐节点采用关系，离线逐站结论
+    const authSrc2 = (await call('POST', `/api/materials/${src}/authorizations`, {
+      media: '*', region: '*', validFrom: '2020-01-01', validTo: '2100-12-31', licensor: 'B2',
+    })).data.id;
+    const mp = await call('POST', '/api/packages', {
+      name: '凭证测试多站', materialIds: [root],
+      stops: [
+        { name: '站一', media: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-10' },
+        { name: '站二', media: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-10' },
+      ],
+    });
+    const mpid = mp.data.id;
+    const mv = await call('POST', '/api/verify', { packageId: mpid });
+    const mpub = await call('POST', `/api/packages/${mpid}/publish`, { basisVersion: mv.data.basisVersion });
+    ok(mpub.status === 201, '多站包发布成功并封存凭证');
+    const matt = mpub.data.attestation;
+    ok(matt.body.adoptions.length === 4
+       && matt.body.itinerary.stops.length === 2
+       && matt.body.terms.some((x) => x.id === authSrc2),
+       '多站凭证封存 2 站 × 2 节点采用关系与全部条款');
+    r = offline(writeJson(matt), [await archiveFile()]);
+    ok(r.code === 0 && r.data.stops.length === 2 && r.data.stops.every((s) => s.eligible),
+       '多站凭证离线返回两站均整段覆盖');
+
+    // 17.7 密钥轮换：旧公钥保留，旧凭证仍可验；只有新公钥则验不过
+    const beforeKid = matt.signature.kid;
+    const rot = await call('POST', '/api/attestation-keys/rotate', { reason: 'e2e' });
+    ok(rot.status === 201 && rot.data.keys.length >= 2
+       && rot.data.keys.some((k) => k.kid === beforeKid)
+       && rot.data.current.kid !== beforeKid,
+       '轮换后旧公钥保留、当前密钥更新');
+    r = offline(writeJson(matt), [await archiveFile()]);
+    ok(r.code === 0, '用含旧公钥的归档仍可验证轮换前凭证');
+    const newOnly = writePem(rot.data.current.publicKeyPem);
+    r = offline(writeJson(matt), [newOnly]);
+    ok(r.code === 1 && r.data.validSignature === false, '仅提供轮换后新公钥时旧凭证验签失败');
+
+    // 17.8 旧发布快照补发：成功补发 + 幂等 + 缺字段明确拒绝（不用当前授权拼凑）
+    const rei = await call('POST', '/api/attestations/reissue', { snapshotId: 1 });
+    ok((rei.status === 201 || (rei.status === 200 && rei.data.alreadySealed === true))
+       && rei.data.attestation.body.sealContext === 'reissue-from-snapshot',
+       '演示库旧发布快照可补发凭证（sealContext 标注补发）');
+    if (rei.status === 201) {
+      r = offline(writeJson(rei.data.attestation), [await archiveFile()]);
+      ok(r.code === 0 && r.data.conclusion === 'PASS', '补发凭证离线校验通过');
+    }
+    const rei2 = await call('POST', '/api/attestations/reissue', { snapshotId: 1 });
+    ok(rei2.data.alreadySealed === true && rei2.data.attestation.signature.value === rei.data.attestation.signature.value,
+       '重复补发幂等：返回原凭证、不重新签名');
+    const dbx = new Database(process.env.DB_PATH || require('path').join(__dirname, '..', 'data', 'app.db'));
+    const oldPayload = JSON.parse(dbx.prepare('SELECT payload FROM verification_snapshots WHERE id=1').get().payload);
+    const deficient = JSON.parse(JSON.stringify(oldPayload));
+    delete deficient.rules;
+    deficient.nodes = deficient.nodes.map((n) => { delete n.paths; delete n.matchedAuthorization; return n; });
+    const info = dbx.prepare(
+      'INSERT INTO verification_snapshots(package_id, kind, basis_version, eligible, payload, created_at) VALUES (?,?,?,?,?,?)'
+    ).run(1, 'publish', deficient.basisVersion, 1, JSON.stringify(deficient), new Date().toISOString());
+    dbx.close();
+    const reiBad = await call('POST', '/api/attestations/reissue', { snapshotId: info.lastInsertRowid });
+    ok(reiBad.status === 422 && reiBad.data.details
+       && reiBad.data.details.code === 'UNSUPPORTED_SNAPSHOT'
+       && Array.isArray(reiBad.data.details.missingFields) && reiBad.data.details.missingFields.length > 0,
+       '缺证明字段的旧快照补发被明确拒绝（422 UNSUPPORTED_SNAPSHOT，逐字段列出）');
+
+    // 17.9 凭证表不可变（触发器）
+    const db2 = new Database(process.env.DB_PATH || require('path').join(__dirname, '..', 'data', 'app.db'));
+    let upBlocked = false, delBlocked = false;
+    try { db2.prepare('UPDATE publish_attestations SET signer_kid=? WHERE id=?').run('x', pub.data.attestationId); }
+    catch { upBlocked = true; }
+    try { db2.prepare('DELETE FROM publish_attestations WHERE id=?').run(pub.data.attestationId); }
+    catch { delBlocked = true; }
+    ok(upBlocked && delBlocked, 'publish_attestations 的 UPDATE/DELETE 均被触发器拒绝');
+    db2.close();
+  }
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

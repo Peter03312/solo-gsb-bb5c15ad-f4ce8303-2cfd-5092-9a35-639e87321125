@@ -15,9 +15,13 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV DB_PATH=/data/app.db
+# 本机持久化签名密钥目录：与数据库同在 /data 命名卷，容器重建不丢密钥，
+# 轮换前的旧公钥也留存在该目录的公钥归档中，旧凭证可持续离线验证。
+ENV ATTEST_KEY_DIR=/data/attestation-keys
 COPY --from=builder /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
+COPY scripts ./scripts
 COPY public ./public
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN mkdir -p /data && chown -R node:node /data /app

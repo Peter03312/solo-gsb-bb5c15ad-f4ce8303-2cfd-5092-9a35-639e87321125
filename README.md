@@ -6,6 +6,8 @@
 
 策展人还可对待发布 / 需复核包录入若干**拟取得的授权报价**（每项注明素材、媒介、地区、有效期与非负整数成本），系统做**只读的报价组合预览**：基于同一份当前授权与来源关系，求**总成本最低**的报价组合，使每站每个入展素材及其全部来源节点均由一份现有有效授权或一份所选报价**独自覆盖整段展期**。共享节点（含跨站）只核算一次、一份报价可覆盖多站、同站短授权/短报价不得拼接；总成本并列时先取报价数少者，再按输入序号序列取字典序最小。无解时按站列出仍缺授权的节点、现有授权与各报价的失格原因及全部来源路径。预览不写入授权、包、状态或快照，依据版本不变，**已发布包不可预览**。
 
+成功发布时，系统在**与发布快照同一个事务**内封存一份**可导出的签名发布凭证（attestation）**：当时的素材清单、完整来源子图、逐站行程、每个站×节点**实际采用的未撤销授权条款全文**与全部来源路径，以及核验规则版本与规则参数，并用**本机持久化 Ed25519 密钥**签名。审计人员**脱离馆内数据库**时，仅凭凭证文件与签发方公开密钥，运行随附的**零依赖独立校验程序**即可复算签名、来源链与**逐站整段覆盖**，得到逐站结论与逐项篡改原因。凭证完全自包含：授权事后修改、撤销或删除**不改变旧凭证**，已发布包转为需复核也不影响旧凭证。**密钥轮换自动保留旧公钥**；升级前的旧发布快照可申请补发，但补发只读取快照自身，**旧快照若缺少证明所需字段则明确拒绝（`422 UNSUPPORTED_SNAPSHOT`），绝不用当前授权拼凑**。
+
 - 后端：Node.js 20 + Express + better-sqlite3（SQLite，同步事务）
 - 前端：原生 HTML/CSS/JS，无构建步骤
 - 交付：Dockerfile + docker-compose 一键启动，数据库自动初始化
@@ -171,6 +173,7 @@ node test/e2e.js
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `DB_PATH` | 本地 `./data/app.db`（容器内 `/data/app.db`） | SQLite 数据库文件路径，所在目录自动创建 |
 | `SEED_DEMO` | `0`（compose 中为 `1`） | 启动时若库为空则写入演示数据 |
+| `ATTEST_KEY_DIR` | `<数据库目录>/attestation-keys`（容器内 `/data/attestation-keys`），无 `DB_PATH` 时为 `~/.exhibit-attestation` | 本机持久化签名密钥与公钥归档目录（首次签发惰性生成；请与数据库一同备份） |
 
 修改端口（例如改为 8080）：编辑 `docker-compose.yml` 的 `ports: - "8080:3000"`（宿主机端口:容器端口），或直接运行时 `-e PORT=...` 并同步映射。
 
@@ -191,7 +194,10 @@ node test/e2e.js
 | `POST /api/verify` | 试核验（body 可传 `packageId`、单站完整字段，或 `{materialIds, stops[]}` 即席多站核验） |
 | `POST /api/packages/:id/schedule/search` | **档期搜索（仅单站）**：多站包返回 `409 MULTI_STOP_UNSUPPORTED` |
 | `POST /api/packages/:id/schedule/apply` | **选定档期改期（仅单站）**：多站包同样 `409 MULTI_STOP_UNSUPPORTED` |
-| `POST /api/packages/:id/publish` | 发布，body 需含核验时的 `basisVersion`；事务内重读行程/清单/依据，过期 409、任一站不合格 422 |
+| `POST /api/packages/:id/publish` | 发布，body 需含核验时的 `basisVersion`；事务内重读行程/清单/依据，过期 409、任一站不合格 422；成功 201 在同一事务内封存签名发布凭证（`attestation`） |
+| `GET /api/packages/:id/attestation` · `GET /api/attestations/by-snapshot/:snapshotId` | 导出已封存发布凭证（`?download=1` 带附件头） |
+| `POST /api/attestations/reissue` | 旧成功发布快照补发凭证（只读快照自身；缺证明字段 422 `UNSUPPORTED_SNAPSHOT`；幂等） |
+| `GET /api/attestation-keys` · `POST /api/attestation-keys/rotate` | 本机签名公钥（当前+历史归档）查询 / 密钥轮换（旧公钥保留） |
 | `POST /api/packages/:id/recheck` | 对需复核包人工重新核验 |
 | `POST /api/changes/preview` | **变更影响预演**（只读）：单笔授权增改撤删 / 单条来源增删，返回将由合格转不合格的已发布包、问题节点、原因与依据版本 |
 | `POST /api/changes/commit` | **确认提交同一操作 + 预演结果**：事务内核版本、重算并比对影响清单；过期/不一致/目标失效/非法均整体拒绝 |
@@ -458,7 +464,117 @@ curl -s -X POST http://localhost:3000/api/packages/12/quotes/preview \
 
 > 报价预览完全只读：调用前后 `/api/state` 的 `basisVersion` 与授权数量不变，包状态与快照表均无变化；报价不会变成真实授权，后续仍由策展人按现有「授权登记 → 核验 → 发布」流程执行。
 
-## 八、目录结构
+## 八、发布凭证：签发、导出与离线独立校验
+
+发布成功（单站或多站）时，服务端在**写入不可变发布快照、置为已发布的同一个 SQLite 事务内**，同时封存一份自包含、可导出的签名凭证（`publish_attestations` 表，与快照表一样有 UPDATE/DELETE 拒绝触发器）。
+
+### 凭证里有什么
+
+| 部分 | 内容 |
+| --- | --- |
+| `manifest` | 当时的入展素材清单（素材 id） |
+| `materials` | 清单与来源闭包内全部节点（id/标题/类型） |
+| `sourceSubgraph` | **完整来源子图**：发布当时这些节点之间的全部来源边（`from → to`，含关系标注） |
+| `itinerary` | **逐站行程**（单站为 1 站；多站为冻结的全部站：站名/媒介/地区/起止日） |
+| `terms` | 每个节点**实际采用**的那份**未撤销授权条款全文**（id、所属素材、媒介、地区、有效期、授权方；显式 `revoked:false`） |
+| `adoptions` | **站 × 节点 → 条款**的逐站采用关系（每个站每个节点恰好一份，不拼接） |
+| `paths` | 每个节点的**全部来源路径**（从清单素材到该节点，含节点标题） |
+| `rules` | **核验规则版本**（`version`）与规则参数（通配符、忽略大小写、闭区间、不可拼接、来源链深度/路径上限） |
+| `signature` | 本机持久化密钥对**确定性规范化 JSON（canonical JSON）** 的 Ed25519 签名（含 `kid`） |
+
+凭证同时记录 `basisVersion`、发布快照 id 与快照 payload 的 SHA-256；它不引用数据库里的活数据，因此**授权之后修改/撤销/删除、来源关系变更、包转入需复核，旧凭证一个字节都不会变**。凭证仅在发布成功时封存；发布失败（422）不产生凭证。
+
+### 离线独立校验程序（审计端，脱离馆内数据库）
+
+`scripts/verify-attestation.js` 是**零第三方依赖**的独立程序（只用 Node.js 内置模块），可单独拷贝到审计环境。它**只需要凭证文件和签发方公开密钥**，自行复算：
+
+1. **签名**：用给定公钥（一把或多把；轮换后请提供归档公钥集合）验证 canonical JSON 上的 Ed25519 签名；
+2. **来源链**：由清单素材沿封存边独立重算来源闭包（检测成环/超深/路径截断）、核对子图完整性（不可增边漏边、不可有不可达节点），并重算每个节点的**全部来源路径**与封存路径逐一比对（防伪造路径、防删漏）；
+3. **逐站整段覆盖**：对每一站、每个闭包节点，取其封存采用条款，按凭证记录的规则版本复算“未撤销 + 媒介命中（`*` 通配、忽略大小写）+ 地区命中 + 有效期闭区间覆盖**该站整段**”。短授权不可拼接；不同站可用不同条款。
+
+输出**逐站结论**（站级 `eligible`、节点级采用条款与失格原因）和累积的**篡改/失配原因**（签名不匹配、公钥不受信、规则版本/参数被改、路径伪造/删漏、边增删、媒介/地区/日期不覆盖、条款撤销等）。退出码 `0`=通过，`1`=不通过/被篡改/密钥不受信，`2`=用法或输入错误。
+
+```bash
+# 1) 馆内导出某已发布包的凭证（也可在成功发布的 201 响应里直接取 attestation）
+curl -s http://<馆内地址>/api/packages/12/attestation -o attestation-pkg12.json
+#   或按发布快照取：/api/attestations/by-snapshot/<snapshotId>?download=1
+
+# 2) 馆内导出全部受信公钥（当前密钥 + 轮换前全部旧公钥，PEM 可多把同放一文件）
+node scripts/attestation-keys.js export-pub trusted-pubkeys.pem
+#   HTTP 等价物：GET /api/attestation-keys（返回 JSON，其中 keys[*].publicKeyPem）
+
+# 3) 审计环境（无需数据库、无需应用代码，仅一个脚本 + 两个文件）：
+node scripts/verify-attestation.js attestation-pkg12.json trusted-pubkeys.pem
+#   机器可读：追加 --json；凭证也可用 - 从标准输入读；
+#   不直接传公钥文件时，可用环境变量 ATTEST_TRUSTED_KEYS=<多公钥 PEM 文件>。
+```
+
+人读输出示例：
+
+```text
+结论：通过 ✅
+包 #12「2026 双城巡展包」　发布快照 #7　封存场景：publish
+签名：有效（kid=ed25519-…，可信密钥：是）　规则版本：1.0.0　依据版本：22
+来源链复算：完整（可达节点 5 个）
+逐站结论：
+  第 0 站「北京首展」 屏幕放映 / 中国大陆 / 2026-03-01~2026-03-20：整段覆盖 ✅（节点 5 个）
+  第 1 站「香港巡展」 沉浸式投影 / 中国香港 / 2026-05-01~2026-05-20：整段覆盖 ✅（节点 5 个）
+```
+
+任一复算不过时结论为「不通过 ❌」，并列出逐站失格节点（如 `DATE_NOT_COVERED`、`MEDIA_MISMATCH`）与顶层篡改原因（如 `SIGNATURE_INVALID`、`PATH_FORGED`、`ORPHAN_MATERIAL`、`RULE_PARAMS_MISMATCH`）。
+
+### 本机签名密钥与轮换
+
+密钥为 Ed25519，PEM 文件保存在 `ATTEST_KEY_DIR`（默认数据库同级 `attestation-keys/`，容器内即 `/data` 持久卷，**无需改动现有启动方式**；首次签发时惰性自动生成）：
+
+- `attestation-ed25519-current.pem`：当前私钥（0600，勿外泄）
+- `attestation-ed25519-current.pub.pem`：当前公钥
+- `attestation-pubkeys.json`：公钥归档，轮换时**旧公钥永久保留**（含停用时间），旧凭证据此继续验证
+
+```bash
+node scripts/attestation-keys.js init                 # 预生成当前密钥（可选；不跑也会在首次发布时生成）
+node scripts/attestation-keys.js public               # 打印当前公钥 PEM
+node scripts/attestation-keys.js list                 # 查看公钥归档（JSON）
+node scripts/attestation-keys.js export-pub all.pem   # 导出当前+全部历史公钥供审计方
+node scripts/attestation-keys.js rotate [原因]         # 轮换：旧公钥自动归档保留
+# HTTP：GET /api/attestation-keys；POST /api/attestation-keys/rotate  body {"reason":"…"}
+```
+
+轮换后：新发布用新密钥签名；**旧凭证仍用归档中的旧公钥验证**——因此审计方应使用 `export-pub` 导出的完整公钥集合；只给当前新公钥时旧凭证会报签名不匹配（符合预期）。备份时请把密钥目录与数据库**一同**安全备份。
+
+### 升级前旧发布快照的凭证补发
+
+升级前产生的已发布快照没有同事务凭证。可对**成功发布（eligible=1）的发布快照**申请补发：
+
+```bash
+curl -s -X POST http://<馆内地址>/api/attestations/reissue \
+  -H 'Content-Type: application/json' -d '{"snapshotId": 1}'
+```
+
+补发（`sealContext:"reissue-from-snapshot"`）**只读该快照自身的 payload**，绝不查询当前授权/来源/素材来凑内容；旧快照多站节点缺少完整来源路径、或缺实际采用条款等证明所需字段时，明确拒绝：
+
+```text
+422 UNSUPPORTED_SNAPSHOT
+details.missingFields = ["…nodes[materialId=…].paths", "…matchedAuthorization", …]
+```
+
+这类包需要在升级后重新核验并发布（或复制为待发布包后重新发布）才能获得凭证。对同一快照重复补发是幂等的：已封存则直接返回原凭证，不重新签名、不覆盖。
+
+### 凭证相关 HTTP API
+
+| 方法 路径 | 作用 |
+| --- | --- |
+| `POST /api/packages/:id/publish` | 发布成功（201）响应在原字段之外新增 `attestationId` 与完整 `attestation`（请求体与既有字段不变；失败仍为 422 且不产生凭证） |
+| `GET /api/packages/:id` / `GET /api/packages` | 包 DTO 新增 `attestationId / attestationSnapshotId / attestationSignedBy / attestationSealContext / attestationCreatedAt`（其余字段不变） |
+| `GET /api/packages/:id/attestation` | 取该包最新发布凭证（`?download=1` 带附件文件名） |
+| `GET /api/attestations/by-snapshot/:snapshotId` | 按发布快照取凭证（`?download=1`） |
+| `POST /api/attestations/reissue` | 旧发布快照补发（body `{"snapshotId":n}`）；已封存幂等返回；缺字段 `422 UNSUPPORTED_SNAPSHOT` |
+| `GET /api/attestation-keys` | 当前密钥目录与全部受信公钥（当前 + 历史） |
+| `POST /api/attestation-keys/rotate` | 轮换签名密钥（旧公钥自动保留） |
+
+原发布请求、发布响应（除**新增**凭证字段外）与快照读取契约（`GET /api/snapshots/:id`）保持完全兼容。
+
+## 九、目录结构
 
 ```
 .
@@ -467,16 +583,22 @@ curl -s -X POST http://localhost:3000/api/packages/12/quotes/preview \
 ├── docker-entrypoint.sh    # 可选演示数据初始化后启动
 ├── package.json
 ├── src
-│   ├── db.js               # SQLite 连接、建表（含 package_stops 行程表/冻结触发器）、版本号/快照不可变触发器
+│   ├── db.js               # SQLite 连接、建表（含 package_stops 行程表/冻结触发器）、版本号/快照/凭证不可变触发器
+│   ├── rules.js            # 核验规则确定性核心与规则版本（发布端与离线校验端共用同一套定义）
+│   ├── attest-keys.js      # 本机持久化 Ed25519 密钥环：惰性生成、签名/验签、canonical JSON、轮换与公钥归档
+│   ├── attest.js           # 发布凭证构建：同从事务封存完整证明要素；旧快照补发（缺字段明确拒绝）
 │   ├── verify.js           # 来源链遍历、成环检测、单站/多站逐节点授权核验、发布后重算
 │   ├── schedule.js         # 档期规划（仅单站；多站包明确拒绝）：起始日折算/交集/合并、事务内重验改期
 │   ├── changes.js          # 单笔变更影响预演（回滚型事务模拟）与确认提交（多站影响按站给出）
 │   ├── quotes.js           # 授权报价组合预览（只读）：报价校验、逐站缺口、精确最低成本集合覆盖求解
-│   ├── server.js           # Express API（多站行程编排、发布事务、依据过期拒绝、/api/changes/preview|commit、/api/packages/:id/quotes/preview）
+│   ├── server.js           # Express API（发布同事务封存凭证、凭证导出/补发、密钥轮换等）
 │   └── seed.js             # 演示数据
+├── scripts
+│   ├── verify-attestation.js  # 独立离线凭证校验程序（零依赖：仅凭凭证+公钥复算签名/来源链/逐站覆盖）
+│   └── attestation-keys.js    # 本机签名密钥管理 CLI（init/public/list/export-pub/rotate）
 ├── public                  # 浏览器前端（无构建；含多站行程表格编辑器、按站结果渲染与授权报价预览弹层）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── test/e2e.js             # 端到端业务规则自检（176 项，含多站巡展 44 项、授权报价预览 28 项）
+└── test/e2e.js             # 端到端业务规则自检（220 项，含多站巡展、授权报价预览、发布凭证签发与离线校验）
 ```

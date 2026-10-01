@@ -3,8 +3,25 @@
 // 核验引擎：来源链遍历 + 逐节点授权判定
 // 授权通配符：媒介或地区填 * 表示覆盖任意值。匹配大小写不敏感。
 
-const MAX_PATH_INSTANCES = 5000;
-const MAX_CHAIN_DEPTH = 100;
+const {
+  RULES_VERSION,
+  RULE_ALGORITHM,
+  MAX_PATH_INSTANCES: RULE_MAX_PATH_INSTANCES,
+  MAX_CHAIN_DEPTH: RULE_MAX_CHAIN_DEPTH,
+} = require('./rules');
+
+const MAX_PATH_INSTANCES = RULE_MAX_PATH_INSTANCES;
+const MAX_CHAIN_DEPTH = RULE_MAX_CHAIN_DEPTH;
+
+// 规则版本与参数：写入每份核验结果（发布快照与凭证据此引用）
+function rulesInfo() {
+  return {
+    version: RULES_VERSION,
+    algorithm: RULE_ALGORITHM,
+    maxChainDepth: MAX_CHAIN_DEPTH,
+    maxPathInstances: MAX_PATH_INSTANCES,
+  };
+}
 
 function isValidDate(s) {
   if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
@@ -273,6 +290,7 @@ function verifyPackage(db, input) {
   return {
     generatedAt: new Date().toISOString(),
     basisVersion: basisVersion(db),
+    rules: rulesInfo(),
     request: { materialIds, medium, region, useFrom, useTo },
     eligible,
     globalErrors,
@@ -546,6 +564,7 @@ function verifyMultiStop(db, input) {
   return {
     generatedAt: new Date().toISOString(),
     basisVersion: basisVersion(db),
+    rules: rulesInfo(),
     multiStop: true,
     request: {
       materialIds,
@@ -570,6 +589,8 @@ function verifyMultiStop(db, input) {
       stopPosition: s.position,
       stopName: s.name,
     }))),
+    // 来源链各站共享：全部来源路径只在此封存一份（避免按站重复），供快照/凭证消费
+    nodePaths: nodeIds.map((id) => ({ materialId: id, paths: pathDTOs.get(id) })),
   };
 }
 

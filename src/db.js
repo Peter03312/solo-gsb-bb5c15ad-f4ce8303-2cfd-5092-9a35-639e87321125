@@ -124,6 +124,18 @@ function initSchema(database) {
       created_at    TEXT NOT NULL
     );
 
+    -- 发布凭证：与发布快照同一事务封存的可导出签名凭证，只追加、不可变
+    CREATE TABLE IF NOT EXISTS publish_attestations (
+      id                  INTEGER PRIMARY KEY,
+      package_id          INTEGER NOT NULL REFERENCES packages(id),
+      verification_snapshot_id INTEGER NOT NULL REFERENCES verification_snapshots(id),
+      signer_kid          TEXT NOT NULL,             -- 签发所用持久化密钥 id
+      seal_context        TEXT NOT NULL,             -- publish | reissue-from-snapshot
+      envelope            TEXT NOT NULL,             -- 完整凭证 JSON（自包含，可导出离线校验）
+      created_at          TEXT NOT NULL,
+      UNIQUE(verification_snapshot_id)
+    );
+
     -- 任何对授权或来源关系的增删改都使核验依据版本号 +1
     CREATE TRIGGER IF NOT EXISTS trg_basis_authz_ins AFTER INSERT ON authorizations
     BEGIN UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'basis_version'; END;
@@ -143,6 +155,12 @@ function initSchema(database) {
     BEGIN SELECT RAISE(ABORT, 'verification snapshots are immutable'); END;
     CREATE TRIGGER IF NOT EXISTS trg_snapshot_no_delete BEFORE DELETE ON verification_snapshots
     BEGIN SELECT RAISE(ABORT, 'verification snapshots are immutable'); END;
+
+    -- 发布凭证同样不可改、不可删
+    CREATE TRIGGER IF NOT EXISTS trg_attestation_no_update BEFORE UPDATE ON publish_attestations
+    BEGIN SELECT RAISE(ABORT, 'publish attestations are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_attestation_no_delete BEFORE DELETE ON publish_attestations
+    BEGIN SELECT RAISE(ABORT, 'publish attestations are immutable'); END;
   `);
 }
 
