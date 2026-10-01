@@ -1,0 +1,16 @@
+{
+  "magic": "exhibit-attestation-keyring-v1",
+  "currentVersion": 1,
+  "keys": [
+    {
+      "version": 1,
+      "kid": "attest-v1-3e09f20fc957",
+      "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAeXUX8xM8WiE9R7vhILFT+IODUAAfz9wkQFt9dl0rRHY=\n-----END PUBLIC KEY-----\n",
+      "privateKeyPem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIGA3X0KWlP8Qp6Evm4x7QQk8Qo59YT2iL1hRZAL6C9Ft\n-----END PRIVATE KEY-----\n",
+      "fingerprintSha256": "3e09f20fc957f727ce4bb6a28af0f97df19590df6f183227d117c13555be70b0",
+      "createdAt": "2026-10-01T21:57:08.175Z",
+      "retiredAt": null,
+      "note": "首次启动自动生成"
+    }
+  ]
+}

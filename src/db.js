@@ -124,6 +124,28 @@ function initSchema(database) {
       created_at    TEXT NOT NULL
     );
 
+    -- 发布凭证：成功发布时与发布快照【同一事务】封存，随后不可改、不可删。
+    -- 授权再被修改/删除不影响本行；离线校验只读导出的信封 + 公开密钥。
+    CREATE TABLE IF NOT EXISTS publish_attestations (
+      id            INTEGER PRIMARY KEY,
+      snapshot_id   INTEGER NOT NULL REFERENCES verification_snapshots(id),
+      package_id    INTEGER NOT NULL REFERENCES packages(id),
+      kid           TEXT NOT NULL,             -- 签发密钥 id（轮换后旧公钥仍保留可验）
+      key_version   INTEGER NOT NULL,
+      alg           TEXT NOT NULL,             -- EdDSA (Ed25519)
+      body_hash     TEXT NOT NULL,             -- body 规范化 JSON 的 sha256（hex）
+      body          TEXT NOT NULL,             -- 规范化 body JSON（清单/来源子图/行程/条款/采用关系）
+      signature     TEXT NOT NULL,             -- 对规范化 body 的 Ed25519 签名（base64url）
+      created_at    TEXT NOT NULL,
+      UNIQUE(snapshot_id)
+    );
+
+    -- 凭证与快照同样不可变、不可删（封存即定稿，后续授权变化绝不回写）
+    CREATE TRIGGER IF NOT EXISTS trg_attestation_no_update BEFORE UPDATE ON publish_attestations
+    BEGIN SELECT RAISE(ABORT, 'publish attestations are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS trg_attestation_no_delete BEFORE DELETE ON publish_attestations
+    BEGIN SELECT RAISE(ABORT, 'publish attestations are immutable'); END;
+
     -- 任何对授权或来源关系的增删改都使核验依据版本号 +1
     CREATE TRIGGER IF NOT EXISTS trg_basis_authz_ins AFTER INSERT ON authorizations
     BEGIN UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'basis_version'; END;

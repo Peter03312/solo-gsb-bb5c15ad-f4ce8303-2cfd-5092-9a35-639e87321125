@@ -9,6 +9,8 @@ services:
       # 容器内 SQLite 数据库文件位置（挂载到宿主机，数据持久化）
       DB_PATH: /data/app.db
       PORT: "3000"
+      # 发布凭证签名密钥目录（位于数据卷内，轮换后的旧公钥长期保留；请随卷备份）
+      ATTESTATION_KEY_DIR: /data/signing-keys
       # 首次启动写入演示数据；数据库非空时自动跳过。正式使用可改为 0。
       SEED_DEMO: "1"
     volumes:

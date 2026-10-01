@@ -2,6 +2,7 @@
 
 // 端到端业务规则测试（针对运行中的 http://localhost:3000）
 const BASE = process.env.BASE || 'http://localhost:3000';
+const path = require('path');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) {
@@ -1003,6 +1004,256 @@ async function call(method, url, body) {
     ok(r.data.multiStop === true && r.data.stopCount === 3
        && r.data.request.quotes[0].index === 0 && r.data.request.quotes[0].licensor === '拟签约方',
        '响应回显 multiStop/站数与报价输入序号、备注');
+  }
+
+  console.log('17) 发布凭证：同事务封存、导出、离线复算、篡改检出、轮换与旧快照拒绝补发');
+  {
+    const { verifyAttestation } = require('../src/attestation-verify-lib');
+    const verifyOffline = (envelope, keyring) =>
+      verifyAttestation(envelope, keyring === undefined ? global.keyring : keyring);
+
+    // 17.0 公开密钥环导出（不含任何私钥材料）
+    let kr = await call('GET', '/api/attestation/keyring');
+    ok(kr.status === 200 && kr.data.format === 'exhibit-attestation-public-keyring-v1'
+       && Array.isArray(kr.data.keys) && kr.data.keys.length >= 1
+       && kr.data.keys.every((k) => k.publicKeyPem && k.kid && k.alg === 'EdDSA'),
+       '公开密钥环可导出，含 kid/alg/PEM 公钥');
+    ok(!JSON.stringify(kr.data).includes('privateKeyPem') && !JSON.stringify(kr.data).includes('PRIVATE KEY'),
+       '公开密钥环不泄露任何私钥材料');
+    global.keyring = kr.data;
+    const kidV1 = kr.data.currentKid;
+
+    // 17.1 成功发布（单站）在同一事务封存凭证；响应附带 attestationId/kid
+    const r0 = await call('POST', '/api/packages', {
+      name: '凭证单站包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-03-01', useTo: '2026-05-31', materialIds: [4],
+    });
+    const pid = r0.data.id;
+    const v = await call('POST', '/api/verify', { packageId: pid });
+    const pub1 = await call('POST', `/api/packages/${pid}/publish`, { basisVersion: v.data.basisVersion });
+    ok(pub1.status === 201 && pub1.data.attestationId && pub1.data.attestationKid === kidV1,
+       '发布成功响应同时返回 snapshotId 与 attestationId/kid');
+    const pkg = await call('GET', `/api/packages/${pid}`);
+    ok(pkg.data.attestationId === pub1.data.attestationId && pkg.data.attestationKid === kidV1,
+       '包 DTO 附带凭证 id 与签发 kid（新增字段，不破坏既有字段）');
+    const snap = await call('GET', `/api/snapshots/${pub1.data.snapshotId}`);
+    ok(snap.data.payload.rulesVersion === 'exhibit-verify-rules-v1', '快照 payload 记录核验规则版本');
+
+    // 17.2 凭证内容：清单 / 完整来源子图 / 逐站行程 / 未撤销条款 / 采用关系
+    const ex = await call('GET', `/api/packages/${pid}/attestation`);
+    ok(ex.status === 200, '可按包导出发布凭证信封');
+    ok(ex.data.format === 'exhibit-publish-attestation-envelope' && ex.data.alg === 'EdDSA'
+       && ex.data.kid === kidV1 && typeof ex.data.signature === 'string' && ex.data.body,
+       '信封含格式/alg/kid/body/签名');
+    const b = ex.data.body;
+    ok(b.format === 'exhibit-publish-attestation' && b.version === 1
+       && b.rulesVersion === 'exhibit-verify-rules-v1'
+       && b.packageId === pid && b.snapshotId === pub1.data.snapshotId
+       && typeof b.snapshotPayloadSha256 === 'string',
+       'body 记录格式版本、规则版本、包/快照 id 与快照载荷哈希');
+    ok(b.manifest.items.map((i) => i.materialId).join() === '4'
+       && b.manifest.items.every((i) => i.title && i.isRoot === true),
+       '凭证封存当时的入展清单（含标题/位次）');
+    ok(b.sourceGraph.nodes.length === 1 && b.sourceGraph.nodes[0].materialId === 4
+       && Array.isArray(b.sourceGraph.edges),
+       '凭证封存完整来源子图（单节点无上游边）');
+    ok(b.itinerary.stops.length === 1 && b.multiStop === false
+       && b.itinerary.stops[0].useFrom === '2026-03-01' && b.itinerary.stops[0].useTo === '2026-05-31',
+       '单站包规范化为一站行程');
+    ok(b.terms.length === 1 && b.terms[0].revoked === false
+       && b.terms[0].validFrom <= '2026-03-01' && b.terms[0].validTo >= '2026-05-31',
+       '封存的条款为实际采用的未撤销授权且覆盖整段（含媒介/地区/有效期/授权方）');
+    ok(b.adoption.length === 1 && b.adoption[0].stopPosition === 0
+       && b.adoption[0].materialId === 4 && b.adoption[0].authorizationId === b.terms[0].authorizationId,
+       '逐站逐节点记录实际采用的授权 id');
+
+    // 17.3 独立离线复算：仅凭凭证 + 公开密钥环
+    const res0 = verifyOffline(ex.data);
+    ok(res0.ok === true && res0.signature.valid === true && res0.eligible === true
+       && res0.stops.length === 1 && res0.stops[0].eligible === true
+       && res0.globalFailReasons.length === 0,
+       '离线校验：签名 + 来源子图 + 整站整段覆盖全部通过，返回逐站结论');
+
+    // 17.4 篡改检出（逐类原因）
+    const tamper = (mut) => { const c = JSON.parse(JSON.stringify(ex.data)); mut(c.body); return c; };
+    const shorter = verifyOffline(tamper((bb) => { bb.terms[0].validTo = '2026-03-02'; }));
+    ok(shorter.signature.valid === false && shorter.ok === false
+       && shorter.stops[0].failReasons.some((f) => f.code === 'NODE_DATE'),
+       '篡改条款有效期：签名失效且逐站结论给出 NODE_DATE（短授权不可拼接）');
+    // 范围篡改用具体媒介/地区的独立素材（避免上游节点的通配/短授权干扰）
+    const mScope = (await call('POST', '/api/materials', { title: '凭证-范围素材', kind: 'video' })).data.id;
+    await call('POST', `/api/materials/${mScope}/authorizations`, {
+      media: '屏幕放映', region: '中国大陆', validFrom: '2026-01-01', validTo: '2026-12-31', licensor: '范围方',
+    });
+    const pScope = (await call('POST', '/api/packages', {
+      name: '凭证范围包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-03-01', useTo: '2026-03-31', materialIds: [mScope],
+    })).data.id;
+    const vScope = await call('GET', '/api/state');
+    const pubScope = await call('POST', `/api/packages/${pScope}/publish`, { basisVersion: vScope.data.basisVersion });
+    ok(pubScope.status === 201, '前置：具体媒介/地区包发布成功');
+    const exScope = (await call('GET', `/api/packages/${pScope}/attestation`)).data;
+    const tamperScope = (field, val, code) => {
+      const c = JSON.parse(JSON.stringify(exScope));
+      c.body.itinerary.stops[0][field] = val;
+      const r = verifyOffline(c);
+      return r.stops[0].failReasons.some((f) => f.code === code);
+    };
+    ok(tamperScope('medium', '户外大屏', 'NODE_MEDIA'), '篡改站媒介：逐站给出 NODE_MEDIA');
+    ok(tamperScope('region', '火星展区', 'NODE_REGION'), '篡改站地区：逐站给出 NODE_REGION');
+    const steal = tamper((bb) => {
+      bb.sourceGraph.nodes.push({ materialId: 9, title: '外来节点', kind: null, isRoot: false });
+    });
+    ok(verifyOffline(steal).globalFailReasons.some((f) => f.code === 'GRAPH_NODE_MISSING'),
+       '向子图塞入不可达节点：来源闭包被破坏（GRAPH_NODE_MISSING）');
+    const sigOnly = tamper((bb) => { bb.packageName = '被改名'; });
+    ok(verifyOffline(sigOnly).signature.valid === false, '任意 body 字段改动都使签名失效');
+    ok(verifyOffline(ex.data, null).signature.code === 'PUBLIC_KEYRING_MISSING'
+       && verifyOffline(ex.data, null).ok === false,
+       '不提供公开密钥环时明确标记无法核验签名（不默认放行）');
+    const otherKr = JSON.parse(JSON.stringify(global.keyring));
+    otherKr.keys = otherKr.keys.filter((k) => k.kid !== kidV1);
+    const unk = verifyOffline(ex.data, otherKr);
+    ok(unk.signature.code === 'UNKNOWN_SIGNING_KEY' && unk.ok === false,
+       '密钥环缺签发公钥：UNKNOWN_SIGNING_KEY 且结论无效');
+    const forged = JSON.parse(JSON.stringify(ex.data));
+    forged.signature = Buffer.from('not-a-real-signature').toString('base64url');
+    ok(verifyOffline(forged).signature.code === 'SIGNATURE_INVALID', '伪造签名：SIGNATURE_INVALID');
+
+    // 17.5 授权随后撤销并删除：旧凭证不变、离线仍有效
+    const termIds = b.terms.map((t) => t.authorizationId);
+    for (const aid of termIds) await call('POST', `/api/authorizations/${aid}/revoke`, {});
+    const afterRevoke = await call('GET', `/api/packages/${pid}/attestation`);
+    ok(JSON.stringify(afterRevoke.data.body) === JSON.stringify(ex.data.body)
+       && afterRevoke.data.signature === ex.data.signature,
+       '授权撤销后凭证 body 与签名逐字节不变');
+    const pkgAfter = await call('GET', `/api/packages/${pid}`);
+    ok(pkgAfter.data.status === 'needs_review' && verifyOffline(afterRevoke.data).ok === true,
+       '包可被标记需复核，但旧凭证离线复算仍然有效（授权变更不改变旧凭证）');
+    for (const aid of termIds) await call('DELETE', `/api/authorizations/${aid}`);
+    const afterDelete = await call('GET', `/api/packages/${pid}/attestation`);
+    ok(afterDelete.data.signature === ex.data.signature && verifyOffline(afterDelete.data).ok === true,
+       '授权物理删除后旧凭证依旧不变、离线验证通过');
+
+    // 17.6 多站包凭证：逐站覆盖、不同站可用不同授权，篡改来源边被检出
+    const mm = await call('POST', '/api/materials', { title: '凭证-多站成片', kind: 'video' });
+    const ms = await call('POST', '/api/materials', { title: '凭证-多站来源', kind: 'audio' });
+    await call('POST', `/api/materials/${mm.data.id}/sources`, { sourceMaterialId: ms.data.id, relation: '配乐' });
+    await call('POST', `/api/materials/${mm.data.id}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 'r',
+    });
+    await call('POST', `/api/materials/${ms.data.id}/authorizations`, {
+      media: '屏幕放映', region: '中国大陆', validFrom: '2026-03-01', validTo: '2026-03-31', licensor: 'bj',
+    });
+    await call('POST', `/api/materials/${ms.data.id}/authorizations`, {
+      media: '沉浸式投影', region: '中国香港', validFrom: '2026-05-01', validTo: '2026-05-31', licensor: 'hk',
+    });
+    const pmp = await call('POST', '/api/packages', {
+      name: '凭证多站包', materialIds: [mm.data.id],
+      stops: [
+        { name: '北京站', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '香港站', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-20' },
+      ],
+    });
+    const mpid = pmp.data.id;
+    const vm = await call('POST', '/api/verify', { packageId: mpid });
+    const pm = await call('POST', `/api/packages/${mpid}/publish`, { basisVersion: vm.data.basisVersion });
+    ok(pm.status === 201 && pm.data.attestationId, '多站合格包发布成功并封存凭证');
+    const mex = await call('GET', `/api/packages/${mpid}/attestation`);
+    ok(mex.data.body.multiStop === true && mex.data.body.itinerary.stops.length === 2
+       && mex.data.body.sourceGraph.nodes.length === 2
+       && mex.data.body.sourceGraph.edges.some((e) => e.from === mm.data.id && e.to === ms.data.id),
+       '多站凭证封存完整行程与包含来源边的完整子图');
+    ok(mex.data.body.adoption.length === 4
+       && new Set(mex.data.body.adoption.map((a) => a.authorizationId)).size >= 2,
+       '逐站 × 每节点各一条采用关系（2 站 × 2 节点），两站来源节点采用不同授权');
+    const mres = verifyOffline(mex.data);
+    ok(mres.ok && mres.stops.every((s) => s.eligible) && mres.stops.length === 2,
+       '离线校验：两站逐站结论均合格（不同站不同授权，整段独自覆盖）');
+    const edgeGone = JSON.parse(JSON.stringify(mex.data));
+    edgeGone.body.sourceGraph.edges = [];
+    const er = verifyOffline(edgeGone);
+    ok(er.globalFailReasons.some((f) => f.code === 'GRAPH_NODE_MISSING')
+       && !er.signature.valid,
+       '删除来源边：来源子图不完整 GRAPH_NODE_MISSING 且签名失效');
+    const overlap = JSON.parse(JSON.stringify(mex.data));
+    overlap.body.itinerary.stops[1].useFrom = '2026-03-10';
+    const or = verifyOffline(overlap);
+    ok(or.globalFailReasons.some((f) => f.code === 'STOPS_OVERLAP'),
+       '篡改行程造成站间重叠：STOPS_OVERLAP（首尾日均占用）');
+
+    // 17.7 密钥轮换：旧凭证用旧公钥继续可验；新凭证由新密钥签发
+    const rot = await call('POST', '/api/attestation/rotate', { note: '测试轮换' });
+    ok(rot.status === 201 && rot.data.rotatedTo.version === 2
+       && rot.data.keyring.keys.some((k) => k.version === 1 && k.retired === true)
+       && rot.data.keyring.keys.some((k) => k.version === 2 && k.current === true),
+       '轮换生成 v2 当前密钥，v1 公钥保留且标记 retired');
+    kr = await call('GET', '/api/attestation/keyring');
+    global.keyring = kr.data;
+    ok(kr.data.keys.length === 2 && !JSON.stringify(kr.data).includes('PRIVATE KEY'),
+       '导出公钥环含新旧两把公钥、无私钥');
+    ok(verifyOffline(ex.data).ok === true && verifyOffline(ex.data).signature.kid === kidV1,
+       '轮换后 v1 旧凭证凭保留的旧公钥仍验证通过');
+    const pn = await call('POST', '/api/packages', {
+      name: '轮换后凭证包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-03-01', useTo: '2026-03-10', materialIds: [ms.data.id],
+    });
+    // ms 的屏幕放映/大陆授权覆盖 3 月
+    const vn = await call('POST', '/api/verify', { packageId: pn.data.id });
+    const pnPub = await call('POST', `/api/packages/${pn.data.id}/publish`, { basisVersion: vn.data.basisVersion });
+    ok(pnPub.status === 201 && pnPub.data.attestationKid === rot.data.rotatedTo.kid,
+       '轮换后的发布由新密钥 v2 签发');
+    const nex = await call('GET', `/api/packages/${pn.data.id}/attestation`);
+    ok(verifyOffline(nex.data).ok === true, 'v2 新凭证离线验证通过（密钥环含 v2 公钥）');
+
+    // 17.8 旧快照（凭证机制上线前的发布）明确拒绝补发，不用当前授权拼凑
+    const legacy = await call('GET', '/api/packages/1/attestation');
+    ok(legacy.status === 422 && legacy.data.details.code === 'LEGACY_SNAPSHOT_INSUFFICIENT'
+       && Array.isArray(legacy.data.details.missingFields) && legacy.data.details.missingFields.length >= 1
+       && legacy.data.details.missingFields.some((m) => m.includes('签名')),
+       '旧发布快照缺证明字段时 422 明确拒绝补发并逐项列出缺失字段（含“无签名”）');
+
+    // 17.9 失败发布（422）不产生凭证
+    const state = await call('GET', '/api/state');
+    const badPub = await call('POST', `/api/packages/${global.pidBad}/publish`, { basisVersion: state.data.basisVersion });
+    ok(badPub.status === 422 && !badPub.data.attestationId, '不合格发布 422 且不封存凭证');
+    const noAtt = await call('GET', `/api/packages/${global.pidBad}/attestation`);
+    ok(noAtt.status === 409 && noAtt.data.details.code === 'NO_PUBLISH_SNAPSHOT',
+       '从未成功发布的包无凭证可导出');
+
+    // 17.10 凭证行数据库层不可变
+    const Database = require('better-sqlite3');
+    const db = new Database(process.env.DB_PATH || '/workspace/data/app.db');
+    let blockU = false, blockD = false;
+    try { db.prepare('UPDATE publish_attestations SET signature=? WHERE id=?').run('x', pub1.data.attestationId); }
+    catch { blockU = true; }
+    try { db.prepare('DELETE FROM publish_attestations WHERE id=?').run(pub1.data.attestationId); }
+    catch { blockD = true; }
+    ok(blockU && blockD, '凭证行 UPDATE/DELETE 被触发器拒绝');
+    db.close();
+
+    // 17.11 CLI（子进程）：文件 + 密钥环，exit code 0/1
+    const { execFileSync } = require('child_process');
+    const fs = require('fs');
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attest-'));
+    const credFile = path.join(dir, 'credential.json');
+    const ringFile = path.join(dir, 'keyring.json');
+    fs.writeFileSync(credFile, JSON.stringify(ex.data));
+    fs.writeFileSync(ringFile, JSON.stringify(global.keyring));
+    let cliExit = 0;
+    try {
+      execFileSync(process.execPath, [path.join(__dirname, '..', 'src', 'attestation-verify.js'),
+        '-c', credFile, '-k', ringFile], { stdio: 'pipe' });
+    } catch (e) { cliExit = e.status || -1; }
+    ok(cliExit === 0, '离线校验 CLI 对有效凭证退出码 0');
+    fs.writeFileSync(credFile, JSON.stringify(forged));
+    cliExit = 0;
+    try {
+      execFileSync(process.execPath, [path.join(__dirname, '..', 'src', 'attestation-verify.js'),
+        '-c', credFile, '-k', ringFile], { stdio: 'pipe' });
+    } catch (e) { cliExit = e.status || -1; }
+    ok(cliExit === 1, '离线校验 CLI 对伪造/篡改凭证退出码 1');
   }
 
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);

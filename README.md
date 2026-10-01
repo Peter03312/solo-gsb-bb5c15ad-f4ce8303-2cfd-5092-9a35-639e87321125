@@ -144,6 +144,22 @@ node test/e2e.js
 - 预览**只读**：不写入授权、包、包状态或任何快照，依据版本（`basisVersion`）保持不变；返回结果自带 `mutated:false`。需复核包可预览（用于测算补授权成本），但预览不会改变其状态。
 - 现有授权已覆盖全部需求时，允许传空报价数组，返回可行且**总成本 0**、选中 0 项。
 
+### 发布凭证：同事务封存、可导出、可完全离线核验
+
+审计人员可能需要在**脱离馆内数据库**的环境核对已发布展览包“当时凭什么授权可以发布”。为此每次**成功发布**都会在与发布快照**同一个 SQLite 事务**内封存一份可导出、带本机数字签名的**发布凭证**：
+
+- 凭证 body 逐字封存发布时刻的：
+  1. **当时的入展清单**（素材、位次、标题）；
+  2. **完整来源子图**（清单根及其全部上游来源节点 + 全部来源边，形成来源闭包）；
+  3. **逐站行程**（单站包规范化为一站；多站包为全部站次的名称/媒介/地区/起止日）；
+  4. **每个节点在每一站实际采用的那一份未撤销授权条款**（媒介/地区/有效期/授权方/条款更新时间；同站一份授权独自覆盖整段，不拼接）；
+  5. **核验规则版本**（`exhibit-verify-rules-v1`）、依据版本（`basisVersion`）与发布快照载荷哈希。
+- body 经规范化 JSON（键排序、无空白）序列化后，用**本机持久化的 Ed25519 私钥**（`EdDSA`）签名；私钥文件权限 `0600`，永不经 HTTP 返回。凭证信封与快照、包状态在同一事务落库，凭证行 `UPDATE/DELETE` 均被触发器拒绝——**任一步失败则发布整体回滚，不存在“发布成功但无凭证”**。
+- **授权随后被修改、撤销或删除不改变旧凭证**：包可能转为需复核，但凭证 body 与签名逐字节不变，离线复算永远以凭证内封存的条款为准。
+- **独立校验程序只需凭证文件 + 公开密钥环**（均为普通 JSON，可用 U 盘带出），不联网、不连馆内数据库：复算**签名**、清单与**来源子图闭包**（含断链/成环/幽灵节点）、**各站整段覆盖与来源链**，返回**逐站结论与具体篡改原因码**（如 `SIGNATURE_INVALID`、`GRAPH_NODE_MISSING`、`STOPS_OVERLAP`、`NODE_DATE`、`ADOPTION_NOT_COVERING` 等）。
+- **密钥轮换只增不删**：轮换生成新的当前签名密钥，旧密钥标记 `retired` 但其公钥永久保留在导出的公开密钥环中——任意历史凭证永远可用签发时的旧公钥验证；密钥环里找不到签发公钥时报 `UNKNOWN_SIGNING_KEY`。
+- **旧快照不补发、不拼凑**：凭证机制上线前发布的包（旧快照不含完整来源边集合、条款撤销快照与签名），导出接口明确返回 `422 LEGACY_SNAPSHOT_INSUFFICIENT` 并逐项列出缺失字段，**绝不读取当前授权/来源去重建旧凭证**。
+
 ---
 
 ## 四、核验规则要点
@@ -161,7 +177,7 @@ node test/e2e.js
 | 发布闸门 | 无全局错误、无缺失素材、无环、无不合格节点（多站：全部站全部节点），且依据版本未过期 |
 | 报价组合预览 | 只读，不写入任何数据；每站每节点须由一份现有授权或一份所选报价独自覆盖整段展期；同站不可拼接短授权/短报价；共享节点（含跨站）一份报价只计一次；最优=总成本最低→报价数少→输入序号序列字典序最小；已发布包不可预览 |
 
-不可变性由数据库强制：`verification_snapshots` 表与多站包发布后的 `package_stops` 行上配置了 `BEFORE UPDATE` / `BEFORE DELETE` 触发器，任何修改或删除都会被 SQLite 直接拒绝。
+不可变性由数据库强制：`verification_snapshots` 表、`publish_attestations` 凭证表与多站包发布后的 `package_stops` 行上配置了 `BEFORE UPDATE` / `BEFORE DELETE` 触发器，任何修改或删除都会被 SQLite 直接拒绝。发布凭证与发布快照在**同一事务**写入；凭证封存失败（含签名/密钥异常）会连同发布整体回滚。
 
 ## 五、配置项（环境变量）
 
@@ -170,14 +186,15 @@ node test/e2e.js
 | `PORT` | `3000` | HTTP 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `DB_PATH` | 本地 `./data/app.db`（容器内 `/data/app.db`） | SQLite 数据库文件路径，所在目录自动创建 |
+| `ATTESTATION_KEY_DIR` | 数据库同目录下 `signing-keys/`（容器内 `/data/signing-keys`） | 发布凭证 Ed25519 签名密钥目录；首次启动自动生成密钥（`keys.json`，权限 0600）。**务必随数据卷一起备份**：丢失私钥不影响旧凭证验证（公钥已导出），但无法再以同一身份签发 |
 | `SEED_DEMO` | `0`（compose 中为 `1`） | 启动时若库为空则写入演示数据 |
 
 修改端口（例如改为 8080）：编辑 `docker-compose.yml` 的 `ports: - "8080:3000"`（宿主机端口:容器端口），或直接运行时 `-e PORT=...` 并同步映射。
 
 ## 六、数据持久化与备份
 
-- Compose 使用命名卷 `exhibit-data` 挂载到容器 `/data`，数据库（WAL 模式）在 `docker compose down` 后仍然保留。
-- 备份：`docker compose exec exhibit-auth node -e "const db=require('better-sqlite3')(process.env.DB_PATH);db.backup('/data/backup.db').then(()=>process.exit(0))"` 后从卷中取 `/data/backup.db`；或停服后直接复制 `app.db`、`app.db-wal`、`app.db-shm`。
+- Compose 使用命名卷 `exhibit-data` 挂载到容器 `/data`，数据库（WAL 模式）与发布凭证签名密钥（`/data/signing-keys/`，默认随 `ATTESTATION_KEY_DIR`）在 `docker compose down` 后仍然保留。
+- 备份：`docker compose exec exhibit-auth node -e "const db=require('better-sqlite3')(process.env.DB_PATH);db.backup('/data/backup.db').then(()=>process.exit(0))"` 后从卷中取 `/data/backup.db`；或停服后直接复制 `app.db`、`app.db-wal`、`app.db-shm`。**请同时备份 `signing-keys/` 目录**（签名私钥丢失不影响已导出公钥对历史凭证的验证，但无法继续以同一身份签发新凭证）。
 
 ## 七、主要 HTTP API
 
@@ -197,6 +214,10 @@ node test/e2e.js
 | `POST /api/changes/commit` | **确认提交同一操作 + 预演结果**：事务内核版本、重算并比对影响清单；过期/不一致/目标失效/非法均整体拒绝 |
 | `POST /api/packages/:id/quotes/preview` | **授权报价组合预览（只读）**：求总成本最低的报价组合覆盖全部站次全部来源节点；无解列出站次/节点/来源路径缺口；不写入任何数据；已发布包 `409 PACKAGE_PUBLISHED` |
 | `GET /api/snapshots/:id` | 读取不可变快照完整内容 |
+| `GET /api/packages/:id/attestation` | **导出成功发布时同事务封存的发布凭证信封**（可离线校验）；旧快照缺字段 `422 LEGACY_SNAPSHOT_INSUFFICIENT`，从未成功发布 `409 NO_PUBLISH_SNAPSHOT` |
+| `GET /api/attestations/:id` | 按凭证 id 导出发布凭证信封 |
+| `GET /api/attestation/keyring` | **导出公开密钥环**（含历次轮换的全部公钥，无私钥；审计人员据此离线验签） |
+| `POST /api/attestation/rotate` | **轮换签名密钥**：旧公钥保留，新发布凭证由新密钥签发（body 可带 `note`） |
 
 ### 多站巡展 API 调用示例
 
@@ -458,6 +479,117 @@ curl -s -X POST http://localhost:3000/api/packages/12/quotes/preview \
 
 > 报价预览完全只读：调用前后 `/api/state` 的 `basisVersion` 与授权数量不变，包状态与快照表均无变化；报价不会变成真实授权，后续仍由策展人按现有「授权登记 → 核验 → 发布」流程执行。
 
+### 发布凭证：签发、导出与离线验证 API 调用示例
+
+发布凭证**无需额外调用**：正常「核验 → 发布」成功时，凭证已与快照在同一事务封存，发布响应里新增 `attestationId` / `attestationKid`（原有字段保持不变）。
+
+第 1 步——正常发布（响应新增凭证标识，旧调用方无需改造）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/packages/12/publish \
+  -H 'Content-Type: application/json' -d '{"basisVersion": 22}'
+# → 201 { "ok": true, "snapshotId": 30, "attestationId": 8,
+#         "attestationKid": "attest-v2-07ee0649fb3e",
+#         "package": { …同旧版，另含 attestationId/attestationKid… }, "result": { … } }
+```
+
+第 2 步——导出**公开密钥环**（审计人员带出馆外；只含公钥）：
+
+```bash
+curl -s http://localhost:3000/api/attestation/keyring -o public-keyring.json
+# → { "format": "exhibit-attestation-public-keyring-v1",
+#     "alg": "EdDSA", "currentVersion": 2, "currentKid": "attest-v2-…",
+#     "keys": [
+#       { "kid": "attest-v1-…", "version": 1, "retired": true,  "current": false,
+#         "alg": "EdDSA", "publicKeyPem": "-----BEGIN PUBLIC KEY-----\n…" },
+#       { "kid": "attest-v2-…", "version": 2, "retired": false, "current": true,  … }
+#     ] }
+```
+
+第 3 步——导出某已发布包的凭证信封（普通 JSON，可直接拷给审计人员）：
+
+```bash
+curl -s http://localhost:3000/api/packages/12/attestation -o package-12.attestation.json
+# → { "format": "exhibit-publish-attestation-envelope", "version": 1,
+#     "kid": "attest-v2-…", "alg": "EdDSA", "sealedAt": "2026-…",
+#     "bodyHash": "…", "signature": "BASE64URL(Ed25519 签名)",
+#     "body": {
+#       "format": "exhibit-publish-attestation", "version": 1,
+#       "rulesVersion": "exhibit-verify-rules-v1",
+#       "packageId": 12, "packageName": "2026 双城巡展包", "snapshotId": 30,
+#       "basisVersion": 22, "multiStop": true, "snapshotPayloadSha256": "…",
+#       "manifest":   { "items": [ { "materialId": 1, "position": 0, "title": "…", "isRoot": true } ] },
+#       "sourceGraph":{ "nodes": [ { "materialId": 1, "title": "…", "isRoot": true }, … ],
+#                       "edges": [ { "id": 17, "from": 1, "to": 4, "relation": "片头字幕" }, … ] },
+#       "itinerary":  { "stops": [ { "position": 0, "name": "北京首展", "medium": "…",
+#                                   "region": "…", "useFrom": "…", "useTo": "…" }, … ] },
+#       "terms":      [ { "authorizationId": 7, "materialId": 4, "media": "*", "region": "*",
+#                         "validFrom": "2026-03-01", "validTo": "2026-05-31", "revoked": false,
+#                         "licensor": "字库公司", "note": "…", "updatedAt": "…" }, … ],
+#       "adoption":   [ { "stopPosition": 0, "materialId": 1, "authorizationId": 3 },
+#                       { "stopPosition": 0, "materialId": 4, "authorizationId": 7 }, … ] } }
+```
+
+> 旧包（凭证机制上线前发布）导出会被**明确拒绝**，不会用当前授权拼凑：
+>
+> ```text
+> 422 { "error": "该包发布于凭证机制上线前，旧发布快照缺少凭证证明所必需的字段，明确拒绝补发…",
+>       "details": { "code": "LEGACY_SNAPSHOT_INSUFFICIENT", "snapshotId": 1,
+>                    "missingFields": ["terms[*].revoked/licensor/updatedAt（…）",
+>                                      "sealingSignature.kid（发布同事务的本机密钥签名；旧快照从未签名）"] } }
+> ```
+
+第 4 步——**离线环境**独立校验（只需 Node.js ≥ 20，无第三方依赖、不联网；把下面两个文件与
+`src/attestation-verify.js`、`src/attestation-verify-lib.js`、`src/canonical.js` 一起拷入即可）：
+
+```bash
+# 单份凭证：人类可读结论，退出码 0=有效 / 1=无效或被篡改
+node src/attestation-verify.js -c package-12.attestation.json -k public-keyring.json -t
+#   签名：✓ 有效（kid=attest-v2-…，签名有效：body 与签发时逐字节一致）
+#   清单：1 件入展品 / 1 根，来源子图 5 节点、4 边，授权条款 8 份，采用关系 10 条
+#   第 1 站「北京首展」 屏幕放映 / 中国大陆 / 2026-03-01~2026-03-20：✓ 整段覆盖（来源链全部节点）
+#   第 2 站「香港巡展」 沉浸式投影 / 中国香港 / 2026-05-01~2026-05-20：✓ 整段覆盖（来源链全部节点）
+#   总结论：✓ 凭证有效：签名、来源子图与逐站整段覆盖全部复算通过
+
+# 机器可读（默认输出 JSON，含逐站结论与全部篡改原因码），可接管道/stdin
+curl -s http://localhost:3000/api/packages/12/attestation \
+  | node src/attestation-verify.js -k public-keyring.json
+# 批量校验一个目录下的所有 *.json 凭证
+node src/attestation-verify.js -d ./audited-credentials/ -k public-keyring.json
+```
+
+复算全部在本地完成：① 用 `kid` 对应公钥验证 Ed25519 签名（并核对 `bodyHash`）；② 校验清单与
+完整来源子图构成来源闭包（多节点/少节点/断链/幽灵节点/成环）；③ 逐站检查行程合法且站间不重叠；
+④ 对每一站的每一个来源节点，从凭证条款中独立判定是否有**一份未撤销授权独自覆盖该站整段展期**，
+并核对凭证声明的“实际采用”授权确实就是该份覆盖授权。任一项不过都会给出**逐站结论 + 原因码**：
+
+| 原因码（摘选） | 含义 |
+| --- | --- |
+| `SIGNATURE_INVALID` / `BODY_HASH_MISMATCH` | 签名与 body 不匹配，或 body 哈希被改动——签发后内容被篡改 |
+| `UNKNOWN_SIGNING_KEY` / `PUBLIC_KEYRING_MISSING` | 密钥环无签发公钥（轮换后未保留旧公钥）/ 未提供密钥环 |
+| `UNSUPPORTED_RULES_VERSION` | 凭证所用核验规则版本校验程序不支持（规则升版保护） |
+| `GRAPH_NODE_MISSING` / `GRAPH_ENDPOINT_MISSING` / `GRAPH_CYCLE` | 来源边被删导致来源链断裂 / 边引用不存在节点 / 来源成环 |
+| `STOPS_OVERLAP` / `STOP_INVALID` / `ITINERARY_INVALID` | 站间重叠（首尾日均占用）/ 站参数非法或倒置 / 行程结构损坏 |
+| `NODE_NO_LICENSE` / `NODE_LICENSE_REVOKED` / `NODE_MEDIA` / `NODE_REGION` / `NODE_DATE` | 该站该节点：凭证内无授权 / 授权已撤销 / 媒介不符 / 地区不符 / 无一份授权独自覆盖整段（短授权不可拼接） |
+| `ADOPTION_MISSING` / `ADOPTION_NOT_COVERING` / `ADOPTION_DUPLICATE` / `ADOPTION_TERM_MISMATCH` | 缺采用声明 / 声明采用的授权不能独自覆盖 / 同站拼接多份 / 授权不属于该节点 |
+| `TERM_REVOKED` / `TERMS_NODE_UNKNOWN` | 被列为依据的条款已撤销 / 条款绑定子图外节点 |
+
+密钥轮换（保留旧公钥，旧凭证持续可验）：
+
+```bash
+# 方式 A：HTTP（管理用途）
+curl -s -X POST http://localhost:3000/api/attestation/rotate \
+  -H 'Content-Type: application/json' -d '{"note":"2027 年度轮换"}'
+# 方式 B：本机 CLI（不经 HTTP）
+npm run attest:rotate -- "年度轮换"
+npm run attest:keyring -- --public        # 只导出公钥环
+# 轮换后务必重新导出公开密钥环分发给审计人员（其中同时包含 v1、v2… 全部公钥）
+curl -s http://localhost:3000/api/attestation/keyring -o public-keyring.json
+```
+
+> 备份提示：签名私钥位于数据卷 `/data/signing-keys/keys.json`（`0600`）。请随数据库一起备份；
+> 私钥丢失不影响历史凭证验证（验证只需已导出的公钥），但之后无法以同一签发身份继续出证。
+
 ## 八、目录结构
 
 ```
@@ -472,11 +604,17 @@ curl -s -X POST http://localhost:3000/api/packages/12/quotes/preview \
 │   ├── schedule.js         # 档期规划（仅单站；多站包明确拒绝）：起始日折算/交集/合并、事务内重验改期
 │   ├── changes.js          # 单笔变更影响预演（回滚型事务模拟）与确认提交（多站影响按站给出）
 │   ├── quotes.js           # 授权报价组合预览（只读）：报价校验、逐站缺口、精确最低成本集合覆盖求解
-│   ├── server.js           # Express API（多站行程编排、发布事务、依据过期拒绝、/api/changes/preview|commit、/api/packages/:id/quotes/preview）
+│   ├── canonical.js        # 规范化 JSON（键排序）+ sha256，签发端与离线校验端共用，零依赖
+│   ├── attestation-keys.js # 本机持久化 Ed25519 签名密钥环（轮换保留全部旧公钥）
+│   ├── attestation-keys-cli.js # 密钥环本机管理 CLI（keyring / rotate）
+│   ├── attestation.js      # 发布凭证构建：清单/完整来源子图/逐站行程/采用条款/规则版本，同事务签名封存
+│   ├── attestation-verify-lib.js # 离线校验核心（签名、来源闭包、逐站整段覆盖复算；零第三方依赖）
+│   ├── attestation-verify.js    # 离线校验 CLI（文件/目录/stdin，JSON 或人类可读输出，退出码 0/1）
+│   ├── server.js           # Express API（多站行程编排、发布事务内封存凭证与快照、密钥环/轮换、/api/changes/preview|commit、/api/packages/:id/quotes/preview）
 │   └── seed.js             # 演示数据
 ├── public                  # 浏览器前端（无构建；含多站行程表格编辑器、按站结果渲染与授权报价预览弹层）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── test/e2e.js             # 端到端业务规则自检（176 项，含多站巡展 44 项、授权报价预览 28 项）
+└── test/e2e.js             # 端到端业务规则自检（219 项，含多站巡展、授权报价预览、发布凭证封存与离线校验 43 项）
 ```

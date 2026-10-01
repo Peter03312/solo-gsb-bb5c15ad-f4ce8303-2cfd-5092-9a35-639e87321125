@@ -19,12 +19,23 @@ const {
 const { previewChange, commitChange, ChangeError } = require('./changes');
 const { searchSchedule, applySchedule, ScheduleError } = require('./schedule');
 const { previewQuotes, QuoteError } = require('./quotes');
+const {
+  buildAndSeal,
+  insertRecord: insertAttestation,
+  rowToEnvelope,
+  legacyMissingFields,
+  AttestationError,
+} = require('./attestation');
+const { getKeyring } = require('./attestation-keys');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const db = get();
+// 启动时确保本机持久化签名密钥存在（首次自动生成；旧公钥随轮换长期保留）
+const keyring = getKeyring();
+keyring.ensure();
 
 class HttpError extends Error {
   constructor(status, message, details) {
@@ -107,6 +118,9 @@ function packageDTO(p, full = false) {
   const publishSnap = db
     .prepare("SELECT * FROM verification_snapshots WHERE package_id=? AND kind='publish' ORDER BY id DESC LIMIT 1")
     .get(p.id);
+  const attestation = db
+    .prepare('SELECT id, snapshot_id, kid, alg, created_at FROM publish_attestations WHERE package_id=? ORDER BY id DESC LIMIT 1')
+    .get(p.id);
   const dto = {
     id: p.id,
     name: p.name,
@@ -128,6 +142,8 @@ function packageDTO(p, full = false) {
       : null,
     publishSnapshotId: publishSnap ? publishSnap.id : null,
     publishEligible: publishSnap ? !!publishSnap.eligible : null,
+    attestationId: attestation ? attestation.id : null,
+    attestationKid: attestation ? attestation.kid : null,
   };
   if (full) {
     dto.snapshots = db
@@ -539,11 +555,12 @@ app.post('/api/packages/:id/publish', (req, res, next) => {
         .map((r) => r.material_id);
       // 发布时在同一事务内重读行程、清单与授权依据：多站包逐站核验，任一站失败则整包不发布
       const result = verifyStoredPackage(db, pkg, items);
-      return { eligible: result.eligible, result };
+      return { eligible: result.eligible, result, items };
     });
 
     if (!decision.eligible) {
-      // 不合格：独立事务留存不可变的发布尝试记录，包状态不变（仍为 draft）
+      // 不合格：独立事务留存不可变的发布尝试记录，包状态不变（仍为 draft）；
+      // 失败发布不产生凭证（没有“合格的授权依据”可封存）。
       const snapId = tx(() => db.prepare(
         `INSERT INTO verification_snapshots(package_id, kind, basis_version, eligible, payload, created_at)
          VALUES (?,?,?,?,?,?)`
@@ -552,27 +569,42 @@ app.post('/api/packages/:id/publish', (req, res, next) => {
         { result: decision.result, snapshotId: snapId });
     }
 
-    // 合格：事务 B 原子提交不可变快照 + published 状态（清单随发布不可再改）
-    const snapshotId = tx(() => {
+    // 合格：单一事务原子提交 发布快照 + 发布凭证 + published 状态。
+    // 凭证 body 中的清单/来源子图/行程/授权条款均在本事务内从库行读取并防御性复算，
+    // 任一步失败（含签名/密钥异常）整体回滚——发布成功必有凭证，反之亦然。
+    const published = tx(() => {
       const currentBasis = db.prepare("SELECT CAST(value AS INTEGER) FROM meta WHERE key='basis_version'").pluck().get();
       if (clientBasis !== currentBasis) {
         throw new HttpError(409,
           `核验依据已过期：核验时版本 ${clientBasis}，当前版本 ${currentBasis}，授权或来源关系在此期间被修改。请重新核验后再发布。`,
           { code: 'STALE_BASIS', clientBasis, currentBasis });
       }
+      const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(id);
+      if (!pkg) throw new HttpError(404, '展览包不存在');
+      if (pkg.status !== 'draft') throw new HttpError(409, `当前状态为 ${pkg.status}，只有待发布包可以发布`);
+
+      const payloadText = JSON.stringify(decision.result);
       const snap = db.prepare(
         `INSERT INTO verification_snapshots(package_id, kind, basis_version, eligible, payload, created_at)
          VALUES (?,?,?,?,?,?)`
-      ).run(id, 'publish', decision.result.basisVersion, 1, JSON.stringify(decision.result), nowIso());
+      ).run(id, 'publish', decision.result.basisVersion, 1, payloadText, nowIso());
+      const snapshotId = snap.lastInsertRowid;
+
+      const sealed = buildAndSeal(db, { pkg, items: decision.items, result: decision.result, snapshotId, payloadText });
+      const attestationId = insertAttestation(db, sealed.record);
+
       db.prepare("UPDATE packages SET status='published', published_at=?, updated_at=? WHERE id=?")
         .run(nowIso(), nowIso(), id);
-      return snap.lastInsertRowid;
+
+      return { snapshotId, attestationId, envelope: sealed.envelope };
     });
 
     res.status(201).json({
       ok: true,
-      message: '发布成功：核验快照与素材清单已原子保存（不可变）',
-      snapshotId,
+      message: '发布成功：核验快照、素材清单与离线可校验发布凭证已在同一事务原子封存（不可变）',
+      snapshotId: published.snapshotId,
+      attestationId: published.attestationId,
+      attestationKid: published.envelope.kid,
       package: packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(id), true),
       result: decision.result,
     });
@@ -703,10 +735,73 @@ app.get('/api/snapshots/:id', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 发布凭证（离线可导出）与签名密钥环 ----------
+// 凭证在发布同一事务封存、不可变；以下接口只读导出，绝不按当前授权重算或补字段。
+app.get('/api/attestations/:id', (req, res, next) => {
+  try {
+    const row = db.prepare('SELECT * FROM publish_attestations WHERE id=?').get(Number(req.params.id));
+    if (!row) throw new HttpError(404, '发布凭证不存在（只有成功发布才封存凭证）');
+    const envelope = rowToEnvelope(row);
+    if (!envelope.body) throw new HttpError(500, '凭证 body 存储内容无法解析');
+    res.json(envelope);
+  } catch (e) { next(e); }
+});
+
+// 按包导出其成功发布时封存的凭证信封（旧包/无凭证时明确拒绝，不用当前授权拼凑）
+app.get('/api/packages/:id/attestation', (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(id);
+    if (!pkg) throw new HttpError(404, '展览包不存在');
+    const row = db
+      .prepare('SELECT * FROM publish_attestations WHERE package_id=? ORDER BY id DESC LIMIT 1')
+      .get(id);
+    if (row) return res.json(rowToEnvelope(row));
+
+    // 无封存凭证：检查该包是否为“凭证机制上线前”的旧发布快照。
+    // 只分析快照 payload 自身字段；缺什么就明确拒绝什么，绝不读当前授权/来源来补。
+    const snap = db
+      .prepare("SELECT * FROM verification_snapshots WHERE package_id=? AND kind='publish' AND eligible=1 ORDER BY id DESC LIMIT 1")
+      .get(id);
+    if (!snap) {
+      throw new HttpError(409, '该包没有成功发布记录，无发布凭证可导出', { code: 'NO_PUBLISH_SNAPSHOT' });
+    }
+    let payload = null;
+    try { payload = JSON.parse(snap.payload); } catch { payload = null; }
+    const missing = legacyMissingFields(payload);
+    throw new HttpError(422,
+      '该包发布于凭证机制上线前，旧发布快照缺少凭证证明所必需的字段，明确拒绝补发（不会使用当前授权或来源拼凑旧凭证）。',
+      { code: 'LEGACY_SNAPSHOT_INSUFFICIENT', snapshotId: snap.id, missingFields: missing });
+  } catch (e) { next(e); }
+});
+
+// 导出公开密钥环（轮换过的全部公钥；供离线审计人员校验任意时期的旧凭证）
+app.get('/api/attestation/keyring', (req, res, next) => {
+  try {
+    res.set('Content-Disposition', 'attachment; filename="public-keyring.json"');
+    res.json(getKeyring().exportPublicKeyringFile());
+  } catch (e) { next(e); }
+});
+
+// 密钥轮换：生成新当前密钥，旧密钥标记 retired 但公钥永久保留（旧凭证继续可验）
+app.post('/api/attestation/rotate', (req, res, next) => {
+  try {
+    const note = str(req.body && req.body.note).trim() || undefined;
+    const out = getKeyring().rotate(note);
+    res.status(201).json({
+      ok: true,
+      message: '签名密钥已轮换：新发布凭证将由新密钥签发；旧公钥已保留，历史凭证仍可用旧公钥离线验证。',
+      ...out,
+    });
+  } catch (e) { next(e); }
+});
+
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
-  if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError || err instanceof QuoteError) {
-    return res.status(err.status).json({ error: err.message, details: err.details });
+  if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError
+    || err instanceof QuoteError || err instanceof AttestationError) {
+    const status = err instanceof AttestationError && !err.status ? 409 : err.status;
+    return res.status(status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {
     return res.status(409).json({ error: '数据库约束拒绝：' + err.message });

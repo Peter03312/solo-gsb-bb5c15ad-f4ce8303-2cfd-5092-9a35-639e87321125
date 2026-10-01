@@ -15,6 +15,8 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV DB_PATH=/data/app.db
+# 发布凭证签名密钥目录（默认位于数据库同目录，随 /data 卷持久化；轮换后的旧公钥长期保留）
+ENV ATTESTATION_KEY_DIR=/data/signing-keys
 COPY --from=builder /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src

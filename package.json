@@ -6,7 +6,10 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "attest:verify": "node src/attestation-verify.js",
+    "attest:rotate": "node src/attestation-keys-cli.js rotate",
+    "attest:keyring": "node src/attestation-keys-cli.js keyring"
   },
   "engines": {
     "node": ">=20"

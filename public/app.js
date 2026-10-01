@@ -539,7 +539,7 @@ async function doPublish(formData, basisVersion) {
   if (!formData.packageId) { toast('请先「保存待发布包」，再发布', true); return; }
   try {
     const r = await api('POST', `/api/packages/${formData.packageId}/publish`, { basisVersion });
-    toast(`发布成功，不可变快照 #${r.snapshotId} 已保存`);
+    toast(`发布成功，不可变快照 #${r.snapshotId} 与离线可校验发布凭证${r.attestationId ? ` #${r.attestationId}` : ''} 已在同一事务封存`);
     await loadState();
     fillPkgForm({});
     openSnapshot(r.snapshotId);

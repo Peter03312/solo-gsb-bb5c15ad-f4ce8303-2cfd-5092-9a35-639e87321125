@@ -6,6 +6,10 @@
 const MAX_PATH_INSTANCES = 5000;
 const MAX_CHAIN_DEPTH = 100;
 
+// 核验规则版本：规则语义（来源链遍历、逐站整段覆盖、短授权不可拼接等）有任何
+// 变更时必须升版；发布凭证逐字记录发布时采用的规则版本，离线校验只认支持的版本。
+const RULES_VERSION = 'exhibit-verify-rules-v1';
+
 function isValidDate(s) {
   if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
   const d = new Date(s + 'T00:00:00Z');
@@ -273,6 +277,7 @@ function verifyPackage(db, input) {
   return {
     generatedAt: new Date().toISOString(),
     basisVersion: basisVersion(db),
+    rulesVersion: RULES_VERSION,
     request: { materialIds, medium, region, useFrom, useTo },
     eligible,
     globalErrors,
@@ -546,6 +551,7 @@ function verifyMultiStop(db, input) {
   return {
     generatedAt: new Date().toISOString(),
     basisVersion: basisVersion(db),
+    rulesVersion: RULES_VERSION,
     multiStop: true,
     request: {
       materialIds,
@@ -646,6 +652,7 @@ module.exports = {
   stopOverlapErrors,
   normalizeStop,
   revalidatePublished,
+  RULES_VERSION,
   REASON_TEXT,
   STOP_REASON_TEXT,
 };
